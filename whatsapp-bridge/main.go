@@ -675,6 +675,34 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// CORS para o app (no navegador do usuário) chamar o bridge local direto.
+// Restrito à origem do app iGlu + localhost. Trata preflight OPTIONS e o
+// Private Network Access do Chrome (https -> http://localhost).
+func corsMiddleware(next http.Handler) http.Handler {
+	allowed := map[string]bool{
+		"https://iglu-demanda.vercel.app": true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && (allowed[origin] ||
+			strings.HasPrefix(origin, "http://localhost") ||
+			strings.HasPrefix(origin, "http://127.0.0.1")) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			}
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
@@ -780,7 +808,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServe(serverAddr, corsMiddleware(http.DefaultServeMux)); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()

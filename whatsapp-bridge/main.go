@@ -204,7 +204,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -399,13 +399,55 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
+	// O WhatsApp não devolve como evento a mensagem que o próprio cliente envia,
+	// então sem isto o que sai pela API nunca aparece no histórico local.
+	if err := storeSentMessage(client, messageStore, recipientJID, resp, msg); err != nil {
+		fmt.Printf("Warning: message sent but not stored locally: %v\n", err)
+	}
+
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// storeSentMessage grava no histórico local uma mensagem enviada por esta bridge,
+// no mesmo formato que handleMessage usa para as mensagens recebidas.
+func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, recipientJID types.JID, resp whatsmeow.SendResponse, msg *waProto.Message) error {
+	chatJID := recipientJID
+	if !resp.Chat.IsEmpty() {
+		chatJID = resp.Chat
+	}
+
+	// Mesmo remetente que o WhatsApp usa nas mensagens "minhas" daquele chat:
+	// o LID em chat @lid, o número nos demais.
+	sender := resp.Sender.User
+	if sender == "" {
+		if chatJID.Server == types.HiddenUserServer && !client.Store.LID.IsEmpty() {
+			sender = client.Store.LID.User
+		} else if client.Store.ID != nil {
+			sender = client.Store.ID.User
+		}
+	}
+
+	timestamp := resp.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	chat := chatJID.String()
+	name := GetChatName(client, messageStore, chatJID, chat, nil, "", waLog.Noop)
+	if err := messageStore.StoreChat(chat, name, timestamp); err != nil {
+		return err
+	}
+
+	content := extractTextContent(msg)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	return messageStore.StoreMessage(resp.ID, chat, sender, content, timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
 }
 
 // Extract media info from a message
@@ -767,7 +809,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1049,12 +1091,15 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
+		// Em chat individual, nunca cair no remetente: quando a mensagem é minha,
+		// o remetente sou eu e o chat ficava com o meu próprio ID como nome.
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
+		} else if err == nil && contact.PushName != "" {
+			name = contact.PushName
+		} else if err == nil && contact.BusinessName != "" {
+			name = contact.BusinessName
 		} else {
 			// Last fallback to JID
 			name = jid.User
